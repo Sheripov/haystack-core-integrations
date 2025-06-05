@@ -246,36 +246,51 @@ class OllamaChatGenerator:
         return default_from_dict(cls, data)
 
     def _build_chunk(self, chunk_response: Any) -> StreamingChunk:
-        """
-        Converts the response from the Ollama API to a StreamingChunk.
-        """
         chunk_response_dict = chunk_response.model_dump()
 
         content = chunk_response_dict["message"]["content"]
+        tool_calls = chunk_response_dict["message"].get("tool_calls", [])
         meta = {key: value for key, value in chunk_response_dict.items() if key != "message"}
         meta["role"] = chunk_response_dict["message"]["role"]
+        meta["tool_calls"] = tool_calls
 
         chunk_message = StreamingChunk(content, meta)
         return chunk_message
 
     def _handle_streaming_response(
-        self, response: Any, streaming_callback: Optional[Callable[[StreamingChunk], None]]
+            self,
+            response: Any,
+            streaming_callback: Optional[Callable[[StreamingChunk], None]],
     ) -> Dict[str, List[Any]]:
-        """
-        Handles streaming response and converts it to Haystack format
-        """
+
         chunks: List[StreamingChunk] = []
+        current_tool_calls = []  # NEW
+
         for chunk in response:
             chunk_delta = self._build_chunk(chunk)
             chunks.append(chunk_delta)
-            if streaming_callback is not None:
+
+            # grab tool calls if present
+            if chunk_delta.meta.get("tool_calls"):
+                current_tool_calls = [
+                    ToolCall(
+                        tool_name=tc["function"]["name"],
+                        arguments=tc["function"]["arguments"],
+                    )
+                    for tc in chunk_delta.meta["tool_calls"]
+                ]
+
+            if streaming_callback:
                 streaming_callback(chunk_delta)
 
-        # Create the ChatMessage with the combined content
-        combined_text = "".join([c.content for c in chunks])
-        reply = ChatMessage.from_assistant(combined_text)
+        combined_text = "".join(c.content for c in chunks)
 
-        # Convert the last chunk's metadata to OpenAI format and attach it to the ChatMessage
+        reply = ChatMessage.from_assistant(
+            text=combined_text,
+            tool_calls=current_tool_calls or None,  # ← keep None if no calls at all
+        )
+
+        # preserve metadata
         if chunks:
             meta = _convert_ollama_meta_to_openai_format(chunks[-1].meta)
             reply._meta = meta
@@ -315,18 +330,6 @@ class OllamaChatGenerator:
         stream = resolved_streaming_callback is not None
         tools = tools or self.tools
         _check_duplicate_tool_names(tools)
-
-        if stream and tools:
-            msg = "Ollama does not support tools and streaming at the same time. Please choose one."
-            raise ValueError(msg)
-
-        if self.response_format and tools:
-            msg = "Ollama does not support tools and response_format at the same time. Please choose one."
-            raise ValueError(msg)
-
-        if self.response_format and stream:
-            msg = "Ollama does not support streaming and response_format at the same time. Please choose one."
-            raise ValueError(msg)
 
         # Convert toolset to list of tools if needed
         if isinstance(tools, Toolset):
